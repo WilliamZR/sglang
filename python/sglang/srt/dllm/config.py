@@ -35,6 +35,7 @@ class DllmConfig:
             "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
+            "DreamForCausalLM": {"block_size": 32, "mask_id": 151669}
         }
 
         arch = model_config.hf_config.architectures[0]
@@ -44,6 +45,12 @@ class DllmConfig:
             mask_id = params["mask_id"]
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
+
+        block_size = (
+            params["block_size"]
+            if server_args.dllm_block_size is None
+            else server_args.dllm_block_size
+        )
 
         max_running_requests = (
             1

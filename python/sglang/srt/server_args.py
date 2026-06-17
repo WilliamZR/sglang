@@ -702,6 +702,7 @@ class ServerArgs:
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
     dllm_algorithm_config: Optional[str] = None
+    dllm_block_size: Optional[int] = None
 
     # Offloading
     cpu_offload_gb: int = 0
@@ -6318,6 +6319,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.dllm_algorithm_config,
             help="The diffusion LLM algorithm configurations. Must be a YAML file.",
+        )
+        parser.add_argument(
+            "--dllm-block-size",
+            type=int,
+            default=ServerArgs.dllm_block_size,
+            help="The block size of the diffusion LLM attention",
         )
 
         # Offloading

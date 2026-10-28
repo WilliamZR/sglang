@@ -9,17 +9,21 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_right_convolution_matches_reference_and_preserves_history():
-    block_size = 32
+@pytest.mark.parametrize("block_size", [1, 4, 32])
+@pytest.mark.parametrize("channels", [128, 8192])
+@pytest.mark.parametrize("activation_dtype", [torch.bfloat16, torch.float16])
+def test_right_convolution_matches_reference_and_preserves_history(
+    block_size, channels, activation_dtype
+):
     from sglang.kernels.ops.mamba.clover_conv_triton import (
         clover_local_memory_conv,
     )
 
     torch.manual_seed(23)
-    raw = torch.randn(block_size * 2, 128, device="cuda", dtype=torch.bfloat16)
-    history = torch.randn(3, 128, 3, device="cuda", dtype=torch.bfloat16)
-    weights = torch.randn(128, 4, device="cuda", dtype=torch.bfloat16)
-    right = torch.randn(128, 1, 3, device="cuda", dtype=torch.bfloat16)
+    raw = torch.randn(block_size * 2, channels, device="cuda", dtype=activation_dtype)
+    history = torch.randn(3, channels, 3, device="cuda", dtype=activation_dtype)
+    weights = torch.randn(channels, 4, device="cuda", dtype=activation_dtype)
+    right = torch.randn(channels, 1, 3, device="cuda", dtype=activation_dtype)
     before = history.clone()
     kw = dict(
         clean_conv_states=history,
@@ -33,7 +37,8 @@ def test_right_convolution_matches_reference_and_preserves_history():
         conv_right_weight=right,
     )
     actual = clover_local_memory_conv(raw, **kw)
-    current = raw.reshape(2, block_size, 128).float()
+    # Explicit per-position causal convolution plus the independent right taps.
+    current = raw.reshape(2, block_size, channels).float()
     joined = torch.cat((history[[2, 0]].transpose(1, 2).float(), current), dim=1)
     expected = torch.zeros_like(current)
     for pos in range(block_size):

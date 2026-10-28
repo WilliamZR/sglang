@@ -184,16 +184,18 @@ def _clover_apply_coreset_kernel(
 def supports_clover_block_coreset_triton(
     router_logits: torch.Tensor, *, top_k: int, block_size: int
 ) -> bool:
+    if not router_logits.is_cuda:
+        return False
+    capability = torch.cuda.get_device_capability(router_logits.device)
     return (
-        router_logits.is_cuda
-        and router_logits.ndim == 2
+        router_logits.ndim == 2
         and router_logits.shape[1] == 256
         and block_size in (4, 8, 16, 32)
         and router_logits.shape[0] > 0
         and router_logits.shape[0] % block_size == 0
         and top_k == 8
         and router_logits.dtype in (torch.bfloat16, torch.float16, torch.float32)
-        and torch.cuda.get_device_capability(router_logits.device)[0] in (9, 10)
+        and (capability == (8, 6) or capability[0] in (9, 10))
     )
 
 

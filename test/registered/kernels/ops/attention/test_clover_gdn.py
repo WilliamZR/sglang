@@ -11,33 +11,40 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("block_size", [2, 32])
-def test_preview_kernel_parity_readonly_and_graph(block_size):
+@pytest.mark.parametrize("block_size", [1, 2, 4, 8, 16, 32])
+@pytest.mark.parametrize("heads", [(2, 4), (16, 32)])
+@pytest.mark.parametrize("activation_dtype", [torch.bfloat16, torch.float16])
+def test_preview_kernel_parity_readonly_and_graph(block_size, heads, activation_dtype):
     from sglang.kernels.ops.attention.clover_gdn_triton import (
         clover_local_memory_triton,
     )
 
     torch.manual_seed(123)
-    q = torch.randn(1, block_size * 2, 2, 128, device="cuda", dtype=torch.bfloat16)
+    q_heads, v_heads = heads
+    q = torch.randn(
+        1, block_size * 2, q_heads, 128, device="cuda", dtype=activation_dtype
+    )
     k = torch.randn_like(q)
-    v = torch.randn(1, block_size * 2, 4, 128, device="cuda", dtype=torch.bfloat16)
-    g = -torch.rand(1, block_size * 2, 4, device="cuda")
-    state = torch.randn(3, 4, 128, 128, device="cuda") * 0.05
+    v = torch.randn(
+        1, block_size * 2, v_heads, 128, device="cuda", dtype=activation_dtype
+    )
+    g = -torch.rand(1, block_size * 2, v_heads, device="cuda")
+    state = torch.randn(3, v_heads, 128, 128, device="cuda") * 0.05
     indices = torch.tensor([1, -1], device="cuda", dtype=torch.int32)
     kw = dict(
         clean_ssm_states=state,
         cache_indices=indices,
         active_valid_mask=torch.ones(block_size * 2, device="cuda", dtype=torch.bool),
         scale=128**-0.5,
-        softmax_logit_scale=torch.full((4,), 10.0, device="cuda"),
-        softmax_history_bias=torch.full((4,), 5.0, device="cuda"),
-        softmax_history_c=torch.ones(4, device="cuda"),
+        softmax_logit_scale=torch.full((v_heads,), 10.0, device="cuda"),
+        softmax_history_bias=torch.full((v_heads,), 5.0, device="cuda"),
+        softmax_history_c=torch.ones(v_heads, device="cuda"),
     )
     kw["active_valid_mask"][block_size:] = False
     before = state.clone()
     # Only the first row is live. Combine its local softmax with the history bucket.
-    qf = q[0, :block_size].float().repeat_interleave(2, dim=1)
-    kf = k[0, :block_size].float().repeat_interleave(2, dim=1)
+    qf = q[0, :block_size].float().repeat_interleave(v_heads // q_heads, dim=1)
+    kf = k[0, :block_size].float().repeat_interleave(v_heads // q_heads, dim=1)
     qf = qf * torch.rsqrt(qf.square().sum(-1, keepdim=True) + 1e-6)
     kf = kf * torch.rsqrt(kf.square().sum(-1, keepdim=True) + 1e-6)
     local_logits = torch.einsum("lhk,shk->hls", qf, kf) * 10
@@ -61,7 +68,7 @@ def test_preview_kernel_parity_readonly_and_graph(block_size):
             "softmax_history_bias",
             "softmax_history_c",
         ):
-            kw[name] = torch.randn(8, device="cuda", dtype=dtype)[::2]
+            kw[name] = torch.randn(2 * v_heads, device="cuda", dtype=dtype)[::2]
         fp32_kw = {
             name: value.float() if name.startswith("softmax_") else value
             for name, value in kw.items()

@@ -15,8 +15,12 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 @unittest.skipUnless(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] in (9, 10),
-    "Clover coreset requires SM90 or SM100-family CUDA",
+    torch.cuda.is_available()
+    and (
+        torch.cuda.get_device_capability() == (8, 6)
+        or torch.cuda.get_device_capability()[0] in (9, 10)
+    ),
+    "Clover coreset requires SM86, SM90 or SM100-family CUDA",
 )
 class TestCloverCoreset(CustomTestCase):
     def test_parity_and_request_isolation(self):

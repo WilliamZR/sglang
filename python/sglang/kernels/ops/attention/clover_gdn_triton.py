@@ -237,9 +237,11 @@ def supports_clover_local_memory_triton(
     block_size: int,
 ) -> bool:
     """Return whether the specialized production kernel supports this shape."""
+    if not query.is_cuda:
+        return False
+    capability = torch.cuda.get_device_capability(query.device)
     return (
-        query.is_cuda
-        and query.dtype in (torch.bfloat16, torch.float16)
+        query.dtype in (torch.bfloat16, torch.float16)
         and key.dtype == query.dtype
         and value.dtype == query.dtype
         and query.ndim == key.ndim == value.ndim == 4
@@ -249,7 +251,7 @@ def supports_clover_local_memory_triton(
         and value.shape[-1] == 128
         and value.shape[2] % query.shape[2] == 0
         and value.shape[2] % key.shape[2] == 0
-        and torch.cuda.get_device_capability(query.device)[0] in (9, 10)
+        and (capability == (8, 6) or capability[0] in (9, 10))
     )
 
 

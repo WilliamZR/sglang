@@ -230,8 +230,9 @@ def clover_local_memory_conv(
     output = torch.empty_like(mixed_qkv)
     block_t = triton.next_power_of_2(block_size)
     num_token_tiles = triton.cdiv(block_size, block_t)
-    # 64-channel tiles measured faster for the batch 1, block 32 preview on Blackwell.
-    block_c = 64 if batch_size == 1 and block_size == 32 else 128
+    # 64-channel tiles measured faster up to batch 2 and 128 from batch 4 on H200,
+    # for block 16 and 32 alike; batch 1, block 32 also favors 64 on Blackwell.
+    block_c = 64 if batch_size <= 2 else 128
     grid = (triton.cdiv(channels, block_c), batch_size * num_token_tiles)
     _bd_gdn_preview_conv_kernel[grid](
         mixed_qkv,

@@ -684,7 +684,7 @@ python3 -m sglang.launch_server \
 
 Select the rule with `--speculative-clover-accept-rule`:
 
-- `threshold` is the default. It accepts a proposal when its target probability is at least `min(ratio, delta * exp(-entropy))` and greater than zero. Configure the ceiling and entropy-scaled factor with `--speculative-clover-accept-ratio` (default `1.0`) and `--speculative-clover-accept-delta` (default `0.6`).
+- `threshold` is the default. It is the typical-acceptance rule from [Medusa](https://arxiv.org/abs/2401.10774): a proposal is accepted when its target probability is at least `min(ratio, delta * exp(-entropy))` and greater than zero. Configure the ceiling and entropy-scaled factor with `--speculative-clover-accept-ratio` (default `1.0`) and `--speculative-clover-accept-delta` (default `0.6`, the value used by the reference Clover serving implementation). Because `delta * exp(-entropy)` never exceeds `delta`, the ratio only takes effect when it is set below `delta`; the default leaves it inactive.
 - `exact` accepts only proposals matching the penalty-adjusted target verify argmax, stopping at the first mismatch.
 
 <Warning>
@@ -695,9 +695,9 @@ Clover sets preferred sampling defaults of `presence_penalty=0.9` and `repetitio
 
 ### Requirements and limitations
 
-- Requires CUDA and BF16. Current end-to-end validation uses NVIDIA H200 GPUs.
+- Requires CUDA compute capability 9.x or 10.x (Hopper or Blackwell) and BF16; other GPUs are rejected at startup. Current end-to-end validation uses NVIDIA H200 GPUs.
 - Uses FlashInfer for full attention and Triton or FlashInfer for linear attention.
-- Requires pipeline parallel size 1. Attention DP/CP, DCP, and all-to-all MoE backends are gated; EP is supported only with the Triton MoE runner.
+- Requires pipeline parallel size 1. Attention DP/CP, DCP, and all-to-all MoE backends are gated; EP is supported only with the Triton MoE runner, and EPLB is not supported.
 - Does not support quantized checkpoints, LoRA, `torch.compile`, adaptive speculation, a separate dLLM algorithm, disaggregation, HiCache, or watermarking.
 - Does not support `min_p`, structured-output constraints, logit bias, logprobs, returned hidden states or routed experts, custom logit processors, or input embedding overrides.
 - Disables the overlap scheduler and mixed chunked prefill, and runs one speculative step with top-k 1. Explicit step, top-k, and mixed chunked prefill values are overridden with a warning.

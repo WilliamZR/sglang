@@ -13,6 +13,7 @@ from sglang.srt.sampling.penaltylib import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -26,6 +27,7 @@ class _Batch:
     def __init__(self, reqs, device):
         self.reqs = reqs
         self.device = device
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
 
 
 def _req(**sampling_params):

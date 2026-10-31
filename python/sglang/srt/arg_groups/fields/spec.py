@@ -38,10 +38,15 @@ class Spec(msgspec.Struct):
         "Neither rule provides distribution-preserving stochastic acceptance.",
     ] = "threshold"
     speculative_clover_accept_ratio: A[
-        float, "Clover acceptance probability ceiling. (Optional)"
+        float,
+        "Clover threshold-rule ceiling (Medusa typical-acceptance epsilon). "
+        "Binds only below the entropy term, which never exceeds the delta, "
+        "so the default 1.0 leaves it inactive. (Optional)",
     ] = 1.0
     speculative_clover_accept_delta: A[
-        float, "Clover entropy-scaled acceptance factor."
+        float,
+        "Clover threshold-rule entropy factor (Medusa typical-acceptance delta). "
+        "The 0.6 default matches the reference Clover serving implementation.",
     ] = 0.6
     uno_lora_path: A[Optional[str], "Path to the UNO draft LoRA checkpoint."] = None
     speculative_draft_model_path: A[

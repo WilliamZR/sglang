@@ -26,6 +26,7 @@ def request(history=(), **params):
         origin_input_ids=[5, 5, 5],
         eos_token_ids={7},
         tokenizer=None,
+        vocab_size=None,
         return_logprob=False,
         return_sampling_mask=False,
         custom_logit_processor=None,
@@ -67,6 +68,23 @@ class TestCloverPenalties(CustomTestCase):
         before = scores.clone()
         apply_clover_penalties(scores, [disabled], torch.ones(1, 4))
         torch.testing.assert_close(scores, before)
+
+    def test_tokenizerless_think_end_resolution_and_vocab_bound(self):
+        """Without a tokenizer, the checkpoint id resolves and out-of-vocab ids are rejected."""
+        generation_config = SimpleNamespace(
+            to_dict=lambda: {"dllm_think_end_token_id": 6}
+        )
+        req = request([1])
+        req.vocab_size = 8
+        self.assertIsNone(
+            validate_clover_request(req, generation_config=generation_config)
+        )
+        self.assertEqual(
+            req.sampling_params.custom_params["dllm_think_end_token_id"], 6
+        )
+        out_of_vocab = request([1], custom_params={"dllm_think_end_token_id": 8})
+        out_of_vocab.vocab_size = 8
+        self.assertIn("valid vocabulary ID", validate_clover_request(out_of_vocab))
 
     def test_cached_history_across_preview_verify_reorder_and_retraction(self):
         state = CloverPenaltyState()

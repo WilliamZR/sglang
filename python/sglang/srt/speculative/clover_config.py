@@ -69,6 +69,12 @@ def configure_clover(server_args):
             )
     if cfg.enable_mixed_chunk:
         logger.warning("CLOVER does not support mixed chunked prefill, disabling it.")
+    if cfg.max_running_requests is None:
+        # Hybrid recurrent-state sizing requires a resolved request cap.
+        declare_resolution(server_args, "CLOVER", max_running_requests=48)
+        logger.warning(
+            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+        )
     preferred = cfg.preferred_sampling_params or {}
     if isinstance(preferred, str):
         preferred = json.loads(preferred)
@@ -88,7 +94,7 @@ def configure_clover(server_args):
     )
 
 
-def validate_clover_request(req):
+def validate_clover_request(req, *, generation_config=None):
     sp = req.sampling_params
     unsupported = []
     for name, default in (("min_p", 0.0),):
@@ -110,4 +116,4 @@ def validate_clover_request(req):
             unsupported.append(name)
     if unsupported:
         return "CLOVER does not support: " + ", ".join(unsupported)
-    return validate_clover_penalties(req)
+    return validate_clover_penalties(req, generation_config=generation_config)

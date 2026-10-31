@@ -13,12 +13,19 @@ import torch
 
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.sampling.custom_logit_processor import DisallowedTokensLogitsProcessor
+from sglang.srt.sampling.penaltylib import (
+    BatchedFrequencyPenalizer,
+    BatchedMinNewTokensPenalizer,
+    BatchedPresencePenalizer,
+    BatchedRepetitionPenalizer,
+)
 from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
     merge_bias_tensor,
 )
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -780,6 +787,42 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertIsNotNone(info.sampling_seed)
         self.assertEqual(info.sampling_seed[0].item(), 123)
         self.assertEqual(info.sampling_seed[1].item(), 42)  # default
+
+    def test_spec_owned_penalties_skip_native_count_buffers(self):
+        """Clover penalizes from its own counts; only min_new_tokens stays native."""
+        native = {
+            BatchedFrequencyPenalizer,
+            BatchedMinNewTokensPenalizer,
+            BatchedPresencePenalizer,
+            BatchedRepetitionPenalizer,
+        }
+        for algorithm, expected in (
+            (SpeculativeAlgorithm.CLOVER, {BatchedMinNewTokensPenalizer}),
+            (SpeculativeAlgorithm.NONE, native),
+        ):
+            with self.subTest(algorithm=algorithm):
+                req = self._make_req(freq=0.5, presence=0.9, min_tokens=4)
+                req.sampling_params.repetition_penalty = 1.05
+                req.eos_token_ids = {2}
+                batch = MagicMock()
+                batch.reqs = [req]
+                batch.device = DEVICE
+                batch.spec_algorithm = algorithm
+                info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+                prepared = {
+                    type(p)
+                    for p in info.penalizer_orchestrator.penalizers.values()
+                    if p.is_prepared()
+                }
+                self.assertEqual(prepared, expected)
+                info.update_penalties()
+                self.assertEqual(
+                    info.acc_scaling_penalties is None,
+                    algorithm.owns_output_penalties(),
+                )
+                logits = torch.zeros(1, VOCAB_SIZE)
+                info.apply_logits_bias(logits)
+                self.assertTrue(torch.isneginf(logits[0, 2]))
 
     def test_from_schedule_batch_sampling_flags(self):
         """Test that sampling flags (need_top_p/top_k/min_p) are set correctly."""

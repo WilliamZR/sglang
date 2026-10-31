@@ -28,8 +28,16 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+_DEVICE_SM = "sglang.srt.arg_groups.model_overrides.clover_moe.get_device_sm"
+
 
 class TestCloverAcceptance(CustomTestCase):
+    def setUp(self):
+        # CPU CI has no GPU; model overrides gate on a supported capability.
+        device_sm = patch(_DEVICE_SM, return_value=90)
+        device_sm.start()
+        self.addCleanup(device_sm.stop)
+
     def test_first_rejection_and_bonus_alignment(self):
         candidates = torch.tensor([[7, 1, 2, 3]]).repeat(4, 1)
         logits = torch.full((4, 4, 8), -20.0)
@@ -193,6 +201,7 @@ class TestCloverAcceptance(CustomTestCase):
                 },
                 "moe-runner-backend triton",
             ),
+            ({"enable_eplb": True, "ep_size": 2, "tp_size": 2}, "enable-eplb"),
         ):
             with self.subTest(**kwargs):
                 args = ServerArgs(
@@ -204,6 +213,24 @@ class TestCloverAcceptance(CustomTestCase):
                 )
                 with self.assertRaisesRegex(ValueError, error):
                     _clover_overrides(args, CloverMoeConfig())
+
+    def test_unsupported_capability_fails_before_weight_load(self):
+        args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            linear_attn_backend="triton",
+            speculative_algorithm="CLOVER",
+        )
+        for device_sm in (90, 100):
+            with patch(_DEVICE_SM, return_value=device_sm):
+                _clover_overrides(args, CloverMoeConfig())
+        for device_sm in (80, 120):
+            with (
+                self.subTest(device_sm=device_sm),
+                patch(_DEVICE_SM, return_value=device_sm),
+                self.assertRaisesRegex(ValueError, "compute capability"),
+            ):
+                _clover_overrides(args, CloverMoeConfig())
 
 
 class TestCloverConfig(CustomTestCase):
@@ -224,6 +251,12 @@ class TestCloverConfig(CustomTestCase):
         self.assertEqual(cfg.speculative_num_draft_tokens, CloverMoeConfig().block_size)
         self.assertTrue(cfg.disable_overlap_schedule)
         self.assertFalse(cfg.enable_mixed_chunk)
+        # Hybrid recurrent-state sizing asserts on an unresolved request cap.
+        self.assertEqual(cfg.max_running_requests, 48)
+        self.assertEqual(
+            resolving_view(self.configure(max_running_requests=7)).max_running_requests,
+            7,
+        )
         self.assertIsNone(args.speculative_num_draft_tokens)
         self.assertEqual(
             resolving_view(
@@ -231,6 +264,40 @@ class TestCloverConfig(CustomTestCase):
             ).speculative_num_draft_tokens,
             8,
         )
+
+    def test_request_row_holds_decode_reserve_at_context_limit(self):
+        """A full-context request's Clover reserve must stay inside its req_to_token row."""
+        from sglang.srt.mem_cache.allocation_sizing import (
+            get_req_to_token_extra_context_len,
+            page_aligned_decode_alloc_lens,
+        )
+        from sglang.srt.runtime_context import get_context, get_parallel
+
+        context_len, width = 1024, 32
+        req = SimpleNamespace(
+            kv=SimpleNamespace(
+                kv_allocated_len=context_len, kv_committed_len=context_len
+            )
+        )
+        for page_size in (1, 16):
+            with (
+                self.subTest(page_size=page_size),
+                (
+                    get_context().override_server_args(
+                        speculative_algorithm="CLOVER",
+                        speculative_num_draft_tokens=width,
+                        page_size=page_size,
+                    )
+                ),
+                get_parallel().override(attn_dcp_size=1),
+            ):
+                # CloverDraftInput inherits the DFlash 2 * width decode reserve.
+                _, ends, _ = page_aligned_decode_alloc_lens(
+                    [req], reserve=2 * width, page_size=page_size
+                )
+                self.assertLessEqual(
+                    ends[0], context_len + get_req_to_token_extra_context_len()
+                )
 
     def test_penalty_defaults_preserve_explicit_server_preferences(self):
         defaults = resolving_view(self.configure()).preferred_sampling_params

@@ -83,7 +83,7 @@ class CloverPenaltyState:
         return counts
 
 
-def validate_clover_penalties(req):
+def validate_clover_penalties(req, *, generation_config=None):
     sp = req.sampling_params
     custom = {
         "dllm_length_penalty": 10.0,
@@ -107,24 +107,34 @@ def validate_clover_penalties(req):
     token = custom.get("dllm_think_end_token_id")
     tokenizer = req.tokenizer
     if custom.get("dllm_think_end_bias", 0) > 0 and token is None:
-        encoded = (
-            tokenizer.encode("</think>", add_special_tokens=False)
-            if tokenizer is not None
-            else []
-        )
-        if len(encoded) != 1 or encoded[0] == getattr(tokenizer, "unk_token_id", None):
+        token = _default_think_end_token(tokenizer, generation_config)
+        if token is None:
             return "CLOVER think-end bias requires a single dllm_think_end_token_id"
-        token = encoded[0]
     if token is not None:
         if (
             type(token) is not int
             or token < 0
+            or (req.vocab_size is not None and token >= req.vocab_size)
             or (tokenizer is not None and token >= len(tokenizer))
         ):
             return "CLOVER dllm_think_end_token_id must be a valid vocabulary ID"
         custom["dllm_think_end_token_id"] = token
     sp.custom_params = custom
     return None
+
+
+def _default_think_end_token(tokenizer, generation_config):
+    # The checkpoint names the id, so requests without a tokenizer still resolve it.
+    if generation_config is not None:
+        token = generation_config.to_dict().get("dllm_think_end_token_id")
+        if token is not None:
+            return token
+    if tokenizer is None:
+        return None
+    encoded = tokenizer.encode("</think>", add_special_tokens=False)
+    if len(encoded) != 1 or encoded[0] == tokenizer.unk_token_id:
+        return None
+    return encoded[0]
 
 
 def _stop_tokens(req, vocab_size):

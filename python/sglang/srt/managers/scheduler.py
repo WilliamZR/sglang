@@ -3064,7 +3064,9 @@ class Scheduler(
         if self.spec_algorithm.is_clover():
             from sglang.srt.speculative.clover_config import validate_clover_request
 
-            error_msg = validate_clover_request(req)
+            error_msg = validate_clover_request(
+                req, generation_config=self.model_config.hf_generation_config
+            )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)

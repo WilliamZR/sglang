@@ -10,7 +10,6 @@ from sglang.kernels.ops.attention.clover_gdn_triton import (
 )
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.elementwise.elementwise import (
-    fused_gate_sigmoid_mul_add,
     fused_sigmoid_mul,
 )
 from sglang.kernels.ops.mamba.clover_conv_triton import (
@@ -22,34 +21,21 @@ from sglang.kernels.ops.moe.clover_coreset_triton import (
     supports_clover_block_coreset_triton,
 )
 from sglang.srt.configs.clover_moe import CloverMoeConfig
-from sglang.srt.layers.layer_boundary import append_stages, declare_attn, declare_ffn
+from sglang.srt.layers.layer_boundary import declare_attn, declare_ffn
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_QUANT_READOUT,
-    Fp8Input,
-    NormQuantReadout,
-)
-from sglang.srt.layers.layernorm import GemmaRMSNorm
-from sglang.srt.layers.linear import (
-    QKVParallelLinear,
-    ReplicatedParallelGroup,
-    RowParallelLinear,
-    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
 )
-from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -62,13 +48,9 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5MoeForCausalLM,
     Qwen3_5MoeForConditionalGeneration,
     _fp8_tuple_input,
-    _layer_fusions,
-    _linear_accepts_fp8_tuple,
-    _refreshes_rope_cos_sin,
 )
 from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
 from sglang.srt.utils import add_prefix, set_weight_attrs
-from sglang.srt.utils.hf_transformers.common import get_rope_config
 
 
 def block_coreset(logits, block_size, top_k, top_p):
@@ -117,13 +99,10 @@ class CloverSparseMoeBlock(Qwen2MoeSparseMoeBlock):
         return False
 
     # The coreset restricts routed experts only, before top-k, and only in preview.
-    def _forward_router_experts(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        forward_batch: Optional[ForwardBatch] = None,
-    ):
-        router_logits, _ = self.gate(hidden_states)
+    def _router_logits(self, hidden_states, *, forward_batch):
+        router_logits = super()._router_logits(
+            hidden_states, forward_batch=forward_batch
+        )
         if (
             self.clover_coreset
             and forward_batch is not None
@@ -135,84 +114,7 @@ class CloverSparseMoeBlock(Qwen2MoeSparseMoeBlock):
                 self.clover_top_k,
                 self.clover_top_p,
             )
-        topk_output = self.topk(hidden_states, router_logits)
-        if self.enable_shared_expert_fusion:
-            if not TopKOutputChecker.format_is_standard(topk_output):
-                raise RuntimeError("Clover shared-expert fusion requires standard TopK")
-            topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
-        return self.experts(hidden_states, topk_output)
-
-    def forward_normal_dual_stream(
-        self,
-        hidden_states: torch.Tensor,
-        use_fused_gate: bool = False,
-        forward_batch: Optional[ForwardBatch] = None,
-    ) -> torch.Tensor:
-        current_stream = torch.cuda.current_stream()
-        self.alt_stream.wait_stream(current_stream)
-        shared_output = (
-            self._forward_shared_experts(
-                hidden_states.clone(), apply_gate=not use_fused_gate
-            )
-            if self.shared_expert is not None
-            else None
-        )
-
-        with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(
-                hidden_states, forward_batch=forward_batch
-            )
-        current_stream.wait_stream(self.alt_stream)
-
-        return router_output, shared_output
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: Optional[ForwardBatch] = None,
-        defer_finalize: bool = False,
-    ) -> torch.Tensor:
-        if defer_finalize:
-            raise RuntimeError("Clover does not use deferred MoE finalization")
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-
-        use_fused_gate = self.shared_expert_gate is not None
-        if hidden_states.shape[0] == 0:
-            shared_output = None
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
-            final_hidden_states = self.experts(hidden_states, topk_output)
-        elif (
-            self.alt_stream is not None
-            and get_is_capture_mode()
-            and not torch.compiler.is_compiling()
-        ):
-            final_hidden_states, shared_output = self.forward_normal_dual_stream(
-                hidden_states,
-                use_fused_gate=use_fused_gate,
-                forward_batch=forward_batch,
-            )
-        else:
-            shared_output = self._forward_shared_experts(
-                hidden_states, apply_gate=not use_fused_gate
-            )
-            final_hidden_states = self._forward_router_experts(
-                hidden_states, forward_batch=forward_batch
-            )
-
-        if shared_output is not None:
-            if use_fused_gate:
-                fused_gate_sigmoid_mul_add(
-                    hidden_states,
-                    self.shared_expert_gate.weight.squeeze(),
-                    shared_output,
-                    final_hidden_states,
-                )
-            else:
-                final_hidden_states += shared_output
-        if self.reduce_results:
-            final_hidden_states = reduce_moe_output(final_hidden_states)
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        return router_logits
 
 
 class CloverRadixLinearAttention(RadixLinearAttention):
@@ -332,47 +234,15 @@ class CloverGatedDeltaNet(Qwen3_5GatedDeltaNet):
 
 class CloverLinearDecoderLayer(Qwen3_5LinearDecoderLayer):
     stage_facts = staticmethod(_clover_stage_facts)
-
-    def __init__(
-        self,
-        config,
-        layer_id,
-        quant_config=None,
-        prefix="",
-        alt_stream=None,
-        is_nextn=False,  # Accepted for the inherited backbone constructor.
-        build_stages=True,
-    ):
-        nn.Module.__init__(self)
-        self.config = config
-        self.layer_id = layer_id
-        self.linear_attn = CloverGatedDeltaNet(
-            config, layer_id, quant_config, alt_stream, prefix
-        )
-        self.mlp = CloverSparseMoeBlock(
-            layer_id=layer_id,
-            config=config,
-            quant_config=quant_config,
-            alt_stream=alt_stream,
-            prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
-            # Follow Qwen3.5: let the parent gate fusion without CUDA opt-in.
-            support_shared_expert_fusion=True,
-            reduce_results=False,
-        )
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        if build_stages:
-            attn, ffn = self.stage_facts(config, layer_id)
-            self.attn_boundary, self.ffn_boundary = append_stages(
-                (attn, self.input_layernorm, {"fusions": None}),
-                (ffn, self.post_attention_layernorm, {"fusions": None}),
-            )
+    is_moe = staticmethod(lambda config: True)
+    linear_attn_cls = CloverGatedDeltaNet
+    moe_block_cls = CloverSparseMoeBlock
 
 
 class CloverAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
     stage_facts = staticmethod(_clover_stage_facts)
+    is_moe = staticmethod(lambda config: True)
+    moe_block_cls = CloverSparseMoeBlock
 
     def __init__(
         self,
@@ -381,89 +251,19 @@ class CloverAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        is_nextn: bool = False,  # Accepted for the inherited backbone constructor.
+        is_nextn: bool = False,
         build_stages: bool = True,
     ) -> None:
-        nn.Module.__init__(self)
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.refreshes_rope_cos_sin = _refreshes_rope_cos_sin(config, layer_id, False)
-        dcp_size = get_parallel().attn_dcp_size
-        kv_parallel_group = ReplicatedParallelGroup("attn_tp", dcp_size)
-        self.kv_tp_rank, self.kv_tp_size = resolve_linear_parallel_group(
-            kv_parallel_group
-        )
-        self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % self.attn_tp_size == 0
-        self.num_heads = self.total_num_heads // self.attn_tp_size
-        self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= self.kv_tp_size:
-            assert self.total_num_kv_heads % self.kv_tp_size == 0
-        else:
-            assert self.kv_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // self.kv_tp_size)
-        self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-
-        self.rope_theta, rope_scaling = get_rope_config(config)
-        self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-        self.layer_id = layer_id
-
-        if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
-            rope_scaling = None
-
-        self.attn_output_gate = getattr(config, "attn_output_gate", True)
-
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=self.max_position_embeddings,
-            rope_scaling=rope_scaling,
-            base=self.rope_theta,
-            partial_rotary_factor=self.partial_rotary_factor,
-            is_neox_style=True,
-            dtype=torch.get_default_dtype(),
-        )
-
-        self.qkv_proj = QKVParallelLinear(
-            config.hidden_size,
-            self.head_dim,
-            self.total_num_heads * (1 + self.attn_output_gate),
-            self.total_num_kv_heads,
-            bias=False,
+        super().__init__(
+            config,
+            layer_id,
             quant_config=quant_config,
-            parallel_group="attn_tp",
-            kv_parallel_group=kv_parallel_group,
-            prefix=add_prefix("qkv_proj", prefix),
+            prefix=prefix,
+            alt_stream=alt_stream,
+            is_nextn=is_nextn,
+            build_stages=build_stages,
         )
-
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=False,
-            parallel_group="attn_tp",
-            prefix=add_prefix("o_proj", prefix),
-        )
-
         # Causal encoding and noncausal preview share projections.
-        self.attn = RadixAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-            attn_type=AttentionType.DECODER,
-            prefix=f"{prefix}.attn",
-            quant_config=quant_config,
-        )
-
         self.attn_preview = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -474,42 +274,6 @@ class CloverAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
             prefix=f"{prefix}.attn",
             quant_config=quant_config,
         )
-
-        self.mlp = CloverSparseMoeBlock(
-            layer_id=layer_id,
-            config=config,
-            quant_config=quant_config,
-            alt_stream=alt_stream,
-            prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
-            support_shared_expert_fusion=True,
-            reduce_results=False,
-        )
-
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
-        accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
-        boundary_fusions = _layer_fusions(config, False)
-        # A subclass that brings its own residual builds the stages itself.
-        if build_stages:
-            attn, ffn = self.stage_facts(
-                config,
-                layer_id,
-                attn_read=NormQuantReadout(
-                    fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
-                ),
-            )
-            self.attn_boundary, self.ffn_boundary = append_stages(
-                (attn, self.input_layernorm, {"fusions": boundary_fusions}),
-                (ffn, self.post_attention_layernorm, {"fusions": boundary_fusions}),
-            )
-
-        self.alt_stream = alt_stream
 
     # Adapted from Qwen3_5AttentionDecoderLayer.self_attention in qwen3_5.py.
     def self_attention(self, positions, hidden_states, forward_batch):

@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import _register_for, resolving_view
+from sglang.srt.utils.common import get_device_sm
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,10 @@ def _clover_overrides(server_args: Any, hf_config: Any) -> dict:
     if cfg.device != "cuda" or cfg.dtype not in ("auto", "bfloat16"):
         raise ValueError(
             "Clover preview kernels require CUDA; serving dtypes other than BF16 are unvalidated"
+        )
+    if get_device_sm() // 10 not in (9, 10):
+        raise ValueError(
+            "Clover preview kernels require compute capability 9.x or 10.x"
         )
     if (
         cfg.linear_attn_backend not in ("triton", "flashinfer")
@@ -54,6 +59,8 @@ def _clover_overrides(server_args: Any, hf_config: Any) -> dict:
         raise ValueError("Clover requires --moe-a2a-backend none")
     if cfg.ep_size > 1 and cfg.moe_runner_backend not in ("auto", "triton"):
         raise ValueError("Clover EP requires --moe-runner-backend triton")
+    if cfg.enable_eplb:
+        raise ValueError("Clover does not support --enable-eplb")
     if cfg.quantization is not None:
         raise ValueError("Clover supports only unquantized models")
     if cfg.disaggregation_mode != "null" or cfg.enable_hierarchical_cache:

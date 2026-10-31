@@ -38,6 +38,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler.spec_algorithm = SimpleNamespace(
                     is_dflash_family=lambda: False,
                     is_uno=lambda: False,
+                    is_clover=lambda: False,
                 )
                 scheduler._add_request_to_queue = MagicMock()
                 scheduler.output_streamer = MagicMock()

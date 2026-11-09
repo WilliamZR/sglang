@@ -9,6 +9,10 @@ from sgl_kernel.scalar_type import scalar_types
 from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+from sglang.srt.layers.quantization.marlin_utils import (
+    marlin_permute_scales,
+    marlin_zero_points,
+)
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_moe_nvfp4_layer_for_marlin,
 )
@@ -16,8 +20,10 @@ from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
     awq_marlin_quantize,
+    get_weight_perm,
     make_nvfp4_weight_and_ref,
     marlin_quantize,
+    marlin_weights,
 )
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
@@ -346,6 +352,85 @@ def test_moe_wna16_marlin_gemm(
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(c_jit, c_aot, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("group_size", [128, -1], ids=["g128", "channel"])
+def test_moe_wna16_marlin_grouped_zero_points(dtype, group_size):
+    """A reused shared slot must not replace the current group's zero points."""
+    torch.manual_seed(1729)
+    m, n, k, e, topk = 32, 1024, 2048, 8, 8
+    effective_group = k if group_size == -1 else group_size
+    num_groups = k // effective_group
+    qweights, scales, zeros, refs = [], [], [], []
+    perm = get_weight_perm(4)
+    for expert in range(e):
+        q = torch.randint(0, 16, (k, n), dtype=torch.int32, device="cuda")
+        # A period greater than two exposes reads from a slot refilled two
+        # groups ahead. Constant/symmetric zero points hide this race.
+        zp = (
+            torch.arange(num_groups, device="cuda")[:, None]
+            + torch.arange(n, device="cuda")[None, :]
+            + expert
+        ) % 14 + 1
+        s = torch.full((num_groups, n), 1 / 128, dtype=dtype, device="cuda")
+        refs.append(
+            ((q - zp.repeat_interleave(effective_group, dim=0)).float() / 128)
+            .to(dtype)
+            .T.contiguous()
+        )
+        qweights.append(marlin_weights(q, k, n, 4, perm))
+        scales.append(marlin_permute_scales(s, k, n, group_size))
+        zeros.append(marlin_zero_points(zp, num_groups, n, 4))
+    qweight, scales, zeros = map(torch.stack, (qweights, scales, zeros))
+    a = torch.randn((m, k), dtype=dtype, device="cuda") / 10
+    ids = torch.arange(e, dtype=torch.int32, device="cuda").expand(m, -1).contiguous()
+    weights = torch.full((m, topk), 1 / topk, device="cuda")
+    expected = torch.stack(
+        [(a.double() @ ref.double().T).to(dtype) for ref in refs], dim=1
+    ).flatten(0, 1)
+    workspace = torch.zeros(
+        torch.cuda.get_device_properties("cuda").multi_processor_count * 4,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    output = torch.empty_like(expected)
+    for block_size in (8, 16):
+        aligned = moe_align_block_size(ids, block_size, e)
+        first = None
+        for _ in range(100):
+            output.fill_(float("nan"))
+            workspace.zero_()
+            _run_single_gemm(
+                moe_wna16_marlin_gemm,
+                a,
+                output,
+                qweight,
+                scales,
+                zeros,
+                None,
+                None,
+                workspace,
+                *aligned,
+                weights,
+                scalar_types.uint4,
+                block_size,
+                topk,
+                m,
+                n,
+                k,
+                False,
+                True,
+                False,
+            )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                output.float(), expected.float(), rtol=0.05, atol=0.001
+            )
+            if first is None:
+                first = output.clone()
+            else:
+                torch.testing.assert_close(output, first, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(

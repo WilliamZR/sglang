@@ -1135,7 +1135,9 @@ __global__ void Marlin(
         }
 
       } else if constexpr (group_blocks >= thread_k_blocks) {
-        if (k % b_sh_wr_iters == 0) {
+        constexpr int g = group_blocks / thread_k_blocks;
+        // Reuse the group's registers before its shared pipeline slot is refilled.
+        if (pipe % g == 0 && k % b_sh_wr_iters == 0) {
           int4* sh_zp_stage =
               sh_zp + zp_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
 #pragma unroll
@@ -1755,6 +1757,8 @@ __global__ void Marlin(
     // the loop seemed to noticeably worse performance after compilation.
     if (slice_iters == 0) {
       cp_async_wait<0>();
+      // All warps must finish reading B before its shared storage is reused.
+      __syncthreads();
       bool last = slice_idx == slice_count - 1;
       // For per-column scales, we only fetch them here in the final step before
       // write-out

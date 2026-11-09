@@ -150,16 +150,18 @@ def supports_clover_local_memory_conv(
     block_size: int,
     activation: str,
 ) -> bool:
+    if not mixed_qkv.is_cuda:
+        return False
+    capability = torch.cuda.get_device_capability(mixed_qkv.device)
     channels = mixed_qkv.shape[-1] if mixed_qkv.ndim == 2 else 0
     width = conv_weights.numel() // channels if channels else 0
     return (
-        mixed_qkv.is_cuda
-        and mixed_qkv.dtype in (torch.bfloat16, torch.float16)
+        mixed_qkv.dtype in (torch.bfloat16, torch.float16)
         and mixed_qkv.ndim == 2
         and block_size in (1, 2, 4, 8, 16, 32)
         and width == 4
         and activation in ("silu", "swish")
-        and torch.cuda.get_device_capability(mixed_qkv.device)[0] in (9, 10)
+        and (capability == (8, 6) or capability[0] in (9, 10))
     )
 
 

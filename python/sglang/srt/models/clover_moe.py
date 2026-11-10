@@ -59,6 +59,7 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
 from sglang.srt.utils import (
+    LazyValue,
     add_prefix,
     get_bool_env_var,
     is_cuda,
@@ -565,6 +566,14 @@ class CloverMoeModel(Qwen3_5MoeForCausalLM):
     }
 
 
+def _moe_weights_by_layer(model):
+    return {
+        layer_id: model.layers[layer_id].mlp.get_moe_weights()
+        for layer_id in range(model.start_layer, model.end_layer)
+        if isinstance(model.layers[layer_id].mlp, CloverSparseMoeBlock)
+    }
+
+
 class CloverMoeModelLM(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -597,6 +606,9 @@ class CloverMoeModelLM(nn.Module):
         self.logits_processor = LogitsProcessor(text_config, return_full_logits=True)
         self.num_fused_shared_experts = self.model.num_fused_shared_experts
         self.enable_shared_expert_fusion = self.model.enable_shared_expert_fusion
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: _moe_weights_by_layer(self.model)
+        )
 
     @torch.no_grad()
     def forward(
@@ -746,6 +758,10 @@ class CloverMoeModelLM(nn.Module):
     # Clover requires PP=1, so both modules are always local.
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

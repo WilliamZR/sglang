@@ -201,7 +201,6 @@ class TestCloverAcceptance(CustomTestCase):
                 },
                 "moe-runner-backend triton",
             ),
-            ({"enable_eplb": True, "ep_size": 2, "tp_size": 2}, "enable-eplb"),
         ):
             with self.subTest(**kwargs):
                 args = ServerArgs(

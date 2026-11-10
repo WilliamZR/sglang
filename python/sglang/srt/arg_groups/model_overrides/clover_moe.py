@@ -59,8 +59,6 @@ def _clover_overrides(server_args: Any, hf_config: Any) -> dict:
         raise ValueError("Clover requires --moe-a2a-backend none")
     if cfg.ep_size > 1 and cfg.moe_runner_backend not in ("auto", "triton"):
         raise ValueError("Clover EP requires --moe-runner-backend triton")
-    if cfg.enable_eplb:
-        raise ValueError("Clover does not support --enable-eplb")
     if cfg.quantization is not None:
         raise ValueError("Clover supports only unquantized models")
     if cfg.disaggregation_mode != "null" or cfg.enable_hierarchical_cache:

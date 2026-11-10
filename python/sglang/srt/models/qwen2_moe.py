@@ -716,7 +716,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 return self.experts(hidden_states, topk_output)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            expert_location_dispatch_info=(
+                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                if not self.is_nextn
+                else None
+            ),
+        )
         if defer_finalize:
             if not self.supports_deferred_finalize:
                 raise RuntimeError(

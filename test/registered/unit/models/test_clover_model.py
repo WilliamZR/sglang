@@ -113,6 +113,35 @@ class TestSharedExpertLoader(CustomTestCase):
             CloverMoeModelLM.load_weights(model, weights + shared[:1] + shared[2:])
 
 
+class TestEplbExpertWeights(CustomTestCase):
+    def test_lists_every_local_moe_layer(self):
+        """EPLB rebalances only the layers this map lists; Clover once exposed none."""
+        from sglang.srt.models.clover_moe import (
+            CloverMoeModelLM,
+            CloverSparseMoeBlock,
+            _moe_weights_by_layer,
+        )
+
+        weights = {layer_id: [torch.full((1,), layer_id)] for layer_id in (1, 3, 4)}
+
+        def moe_block(layer_id):
+            block = CloverSparseMoeBlock.__new__(CloverSparseMoeBlock)
+            block.get_moe_weights = lambda: weights[layer_id]
+            return block
+
+        dense = SimpleNamespace(mlp=None)
+        model = SimpleNamespace(
+            layers=[dense, SimpleNamespace(mlp=moe_block(1)), dense]
+            + [SimpleNamespace(mlp=moe_block(i)) for i in (3, 4)],
+            start_layer=0,
+            end_layer=4,
+        )
+
+        self.assertEqual(_moe_weights_by_layer(model), {1: weights[1], 3: weights[3]})
+        self.assertIsInstance(
+            CloverMoeModelLM.__dict__["routed_experts_weights_of_layer"], property
+        )
+
 if __name__ == "__main__":
     import sys
 

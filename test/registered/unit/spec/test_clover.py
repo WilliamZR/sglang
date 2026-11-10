@@ -166,6 +166,7 @@ class TestCloverAcceptance(CustomTestCase):
             {"dp_size": 2},
             {"tp_size": 2, "ep_size": 2},
             {"tp_size": 2, "ep_size": 2, "moe_runner_backend": "triton"},
+            {"tp_size": 2, "ep_size": 2, "moe_runner_backend": "deep_gemm"},
         ):
             with self.subTest(**kwargs):
                 args = ServerArgs(
@@ -182,7 +183,10 @@ class TestCloverAcceptance(CustomTestCase):
                 self.assertEqual(cfg.dp_size, kwargs.get("dp_size", 1))
                 self.assertEqual(cfg.ep_size, kwargs.get("ep_size", 1))
                 if cfg.ep_size > 1:
-                    self.assertEqual(cfg.moe_runner_backend, "triton")
+                    self.assertEqual(
+                        cfg.moe_runner_backend,
+                        kwargs.get("moe_runner_backend", "triton"),
+                    )
 
     def test_parallel_gate_keeps_unvalidated_dispatch_disabled(self):
         # Replica DP must not enable attention DP, and later A2A resolution
@@ -199,9 +203,8 @@ class TestCloverAcceptance(CustomTestCase):
                     "tp_size": 2,
                     "moe_runner_backend": "flashinfer_cutlass",
                 },
-                "moe-runner-backend triton",
+                "moe-runner-backend triton or deep_gemm",
             ),
-            ({"enable_eplb": True, "ep_size": 2, "tp_size": 2}, "enable-eplb"),
         ):
             with self.subTest(**kwargs):
                 args = ServerArgs(

@@ -55,12 +55,31 @@ def _clover_overrides(server_args: Any, hf_config: Any) -> dict:
     if cfg.pp_size != 1:
         raise ValueError("Clover requires pipeline parallel size 1")
     # A2A backends can expand EP during later argument resolution.
-    if cfg.moe_a2a_backend != "none":
-        raise ValueError("Clover requires --moe-a2a-backend none")
-    if cfg.ep_size > 1 and cfg.moe_runner_backend not in ("auto", "triton"):
+    use_deepep = cfg.moe_a2a_backend == "deepep"
+    if cfg.moe_a2a_backend not in ("none", "deepep"):
+        raise ValueError("Clover requires --moe-a2a-backend none or deepep")
+    if use_deepep and cfg.moe_runner_backend not in ("auto", "deep_gemm"):
+        raise ValueError("Clover DeepEP requires --moe-runner-backend deep_gemm")
+    # Auto dispatches prefill in normal mode and the preview and verify steps,
+    # which run as decode batches, in low-latency mode; forcing low latency would
+    # send whole prompts through its per-rank token cap.
+    if use_deepep and cfg.deepep_mode not in ("auto", "normal"):
+        raise ValueError("Clover DeepEP requires --deepep-mode auto or normal")
+    # The expert-distribution recorder has no gatherer for auto DeepEP mode.
+    if (
+        use_deepep
+        and cfg.deepep_mode == "auto"
+        and (cfg.enable_eplb or cfg.expert_distribution_recorder_mode is not None)
+    ):
+        raise ValueError(
+            "Clover EPLB or expert recording with DeepEP requires --deepep-mode normal"
+        )
+    if (
+        not use_deepep
+        and cfg.ep_size > 1
+        and cfg.moe_runner_backend not in ("auto", "triton")
+    ):
         raise ValueError("Clover EP requires --moe-runner-backend triton")
-    if cfg.enable_eplb:
-        raise ValueError("Clover does not support --enable-eplb")
     if cfg.quantization is not None:
         raise ValueError("Clover supports only unquantized models")
     if cfg.disaggregation_mode != "null" or cfg.enable_hierarchical_cache:
@@ -76,6 +95,8 @@ def _clover_overrides(server_args: Any, hf_config: Any) -> dict:
         "attention_backend": "flashinfer",
         "mamba_radix_cache_strategy": strategy,
     }
-    if cfg.ep_size > 1:
+    if use_deepep:
+        overrides["moe_runner_backend"] = "deep_gemm"
+    elif cfg.ep_size > 1:
         overrides["moe_runner_backend"] = "triton"
     return overrides

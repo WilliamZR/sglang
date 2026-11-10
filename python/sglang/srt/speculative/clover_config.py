@@ -7,6 +7,7 @@ import math
 
 from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
+from sglang.srt.environ import envs
 from sglang.srt.speculative.clover_penalty import validate_clover_penalties
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,12 @@ def configure_clover(server_args):
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
+    if cfg.moe_a2a_backend == "deepep":
+        _check_deepep_dispatch_cap(
+            max_running_requests=resolving_view(server_args).max_running_requests,
+            width=width,
+            tp_size=cfg.tp_size,
+        )
     preferred = cfg.preferred_sampling_params or {}
     if isinstance(preferred, str):
         preferred = json.loads(preferred)
@@ -92,6 +99,19 @@ def configure_clover(server_args):
         disable_overlap_schedule=True,
         enable_mixed_chunk=False,
     )
+
+
+def _check_deepep_dispatch_cap(*, max_running_requests, width, tp_size):
+    # Preview and verify dispatch in low-latency mode, where each rank sends its
+    # attention-TP slice of every request's block.
+    needed = math.ceil(max_running_requests * width / tp_size)
+    cap = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    if needed > cap:
+        raise ValueError(
+            f"CLOVER with DeepEP dispatches up to {needed} tokens per rank, above "
+            f"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK={cap}; raise it or "
+            "lower --max-running-requests."
+        )
 
 
 def validate_clover_request(req, *, generation_config=None):

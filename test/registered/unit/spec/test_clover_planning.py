@@ -158,14 +158,19 @@ class TestCloverPlanning(CustomTestCase):
             req_pool_indices=torch.arange(bs),
             sampling_info=None,
             spec_algorithm=None,
+            global_num_tokens=None,
         )
-        fb = worker._preview_batch(
-            batch,
-            torch.zeros(bs, width, dtype=torch.int64),
-            (prefixes[:, None] + torch.arange(width)).reshape(-1),
-            torch.arange(bs * width),
-            SimpleNamespace(bind=lambda *args: None),
-        )
+        with patch(
+            "sglang.srt.speculative.clover_worker.enable_num_token_non_padded",
+            return_value=False,
+        ):
+            fb = worker._preview_batch(
+                batch,
+                torch.zeros(bs, width, dtype=torch.int64),
+                (prefixes[:, None] + torch.arange(width)).reshape(-1),
+                torch.arange(bs * width),
+                SimpleNamespace(bind=lambda *args: None),
+            )
         runner = CloverDraftCudaGraphRunner.__new__(CloverDraftCudaGraphRunner)
         runner.captured_req_width = width
         padded_bs = 4 if bs == 3 else bs
@@ -183,6 +188,49 @@ class TestCloverPlanning(CustomTestCase):
         self.assertEqual(
             fb.extend_start_loc.tolist(), list(range(0, bs * width, width))
         )
+
+    def test_preview_batch_carries_its_own_token_counts(self):
+        """Graph replay keeps a shared non-padded count the batch omits; under
+        DeepEP a stale prefill count masked most preview rows out of the MoE."""
+        from sglang.srt.speculative.clover_worker import CloverWorker
+
+        width, bs = 16, 3
+        worker = CloverWorker.__new__(CloverWorker)
+        worker.block_size = width
+        worker.device = "cpu"
+        worker.model_runner = SimpleNamespace(kv_index_translator=None)
+        prefixes = torch.arange(bs) + 5
+        for global_num_tokens in (None, [999]):
+            batch = SimpleNamespace(
+                batch_size=lambda: bs,
+                seq_lens=prefixes,
+                seq_lens_cpu=prefixes,
+                req_pool_indices=torch.arange(bs),
+                sampling_info=None,
+                spec_algorithm=None,
+                global_num_tokens=global_num_tokens,
+                can_run_decode_cuda_graph=True,
+            )
+            with patch(
+                "sglang.srt.speculative.clover_worker.enable_num_token_non_padded",
+                return_value=True,
+            ):
+                fb = worker._preview_batch(
+                    batch,
+                    torch.zeros(bs, width, dtype=torch.int64),
+                    (prefixes[:, None] + torch.arange(width)).reshape(-1),
+                    torch.arange(bs * width),
+                    SimpleNamespace(bind=lambda *args: None),
+                )
+            self.assertEqual(fb.global_num_token_non_padded_cpu, bs * width)
+            self.assertEqual(int(fb.global_num_token_non_padded), bs * width)
+            if global_num_tokens is None:
+                self.assertIsNone(fb.global_num_tokens_cpu)
+            else:
+                # The scheduler's count is the verify batch's, not the preview's.
+                self.assertEqual(fb.global_num_tokens_cpu, [bs * width])
+                self.assertEqual(fb.global_num_tokens_gpu.tolist(), [bs * width])
+                self.assertTrue(fb.can_run_decode_cuda_graph)
 
     def test_preview_host_layout_uses_batch_speculative_width(self):
         # Preview KV lengths include the block, and host CSR must refresh per call.

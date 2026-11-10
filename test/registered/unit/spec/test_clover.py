@@ -166,6 +166,7 @@ class TestCloverAcceptance(CustomTestCase):
             {"dp_size": 2},
             {"tp_size": 2, "ep_size": 2},
             {"tp_size": 2, "ep_size": 2, "moe_runner_backend": "triton"},
+            {"tp_size": 2, "moe_a2a_backend": "deepep"},
         ):
             with self.subTest(**kwargs):
                 args = ServerArgs(
@@ -181,7 +182,9 @@ class TestCloverAcceptance(CustomTestCase):
                 cfg = resolving_view(args)
                 self.assertEqual(cfg.dp_size, kwargs.get("dp_size", 1))
                 self.assertEqual(cfg.ep_size, kwargs.get("ep_size", 1))
-                if cfg.ep_size > 1:
+                if cfg.moe_a2a_backend == "deepep":
+                    self.assertEqual(cfg.moe_runner_backend, "deep_gemm")
+                elif cfg.ep_size > 1:
                     self.assertEqual(cfg.moe_runner_backend, "triton")
 
     def test_parallel_gate_keeps_unvalidated_dispatch_disabled(self):
@@ -192,7 +195,27 @@ class TestCloverAcceptance(CustomTestCase):
             ({"attn_dp_size": 2, "tp_size": 2}, "attention DP/CP"),
             ({"attn_cp_size": 2, "tp_size": 2}, "attention DP/CP"),
             ({"dcp_size": 2, "tp_size": 2}, "DCP"),
-            ({"moe_a2a_backend": "deepep", "tp_size": 2}, "moe-a2a-backend none"),
+            ({"moe_a2a_backend": "mooncake", "tp_size": 2}, "none or deepep"),
+            (
+                {
+                    "moe_a2a_backend": "deepep",
+                    "tp_size": 2,
+                    "moe_runner_backend": "triton",
+                },
+                "moe-runner-backend deep_gemm",
+            ),
+            (
+                {
+                    "moe_a2a_backend": "deepep",
+                    "tp_size": 2,
+                    "deepep_mode": "low_latency",
+                },
+                "deepep-mode auto or normal",
+            ),
+            (
+                {"moe_a2a_backend": "deepep", "tp_size": 2, "enable_eplb": True},
+                "requires --deepep-mode normal",
+            ),
             (
                 {
                     "ep_size": 2,
@@ -201,7 +224,6 @@ class TestCloverAcceptance(CustomTestCase):
                 },
                 "moe-runner-backend triton",
             ),
-            ({"enable_eplb": True, "ep_size": 2, "tp_size": 2}, "enable-eplb"),
         ):
             with self.subTest(**kwargs):
                 args = ServerArgs(
@@ -264,6 +286,21 @@ class TestCloverConfig(CustomTestCase):
             ).speculative_num_draft_tokens,
             8,
         )
+
+    def test_deepep_dispatch_cap_covers_every_preview_row(self):
+        """Low-latency DeepEP fails at runtime if a rank's preview rows exceed its cap."""
+        from sglang.srt.environ import envs
+
+        width = CloverMoeConfig().block_size
+        fits = 128 * 8 // width
+        with envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
+            self.configure(
+                moe_a2a_backend="deepep", tp_size=8, max_running_requests=fits
+            )
+            with self.assertRaisesRegex(ValueError, "DISPATCH_TOKENS_PER_RANK"):
+                self.configure(
+                    moe_a2a_backend="deepep", tp_size=8, max_running_requests=fits + 1
+                )
 
     def test_request_row_holds_decode_reserve_at_context_limit(self):
         """A full-context request's Clover reserve must stay inside its req_to_token row."""

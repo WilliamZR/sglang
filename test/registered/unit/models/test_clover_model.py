@@ -60,6 +60,35 @@ def test_coreset_is_per_request_and_stable_on_ties():
     assert torch.isneginf(tied[:, 1:]).all()
 
 
+def test_coreset_on_scattered_rows_matches_whole_blocks(monkeypatch):
+    """Under an a2a backend each rank routes a slice of rows that cuts through
+    blocks; its coreset must still be the one chosen over whole blocks."""
+    import sglang.srt.models.clover_moe as clover_moe
+
+    tp_size, block = 4, 8
+    logits = torch.randn(2 * block, 6, generator=torch.Generator().manual_seed(0))
+    expected = block_coreset(logits, block, 2, 0.5)
+    monkeypatch.setattr(
+        clover_moe,
+        "attn_tp_all_gather_into_tensor",
+        lambda output, _: output.copy_(logits),
+    )
+    rank_local = []
+    for rank, local in enumerate(logits.tensor_split(tp_size)):
+        monkeypatch.setattr(
+            clover_moe,
+            "get_parallel",
+            lambda: SimpleNamespace(attn_tp_size=tp_size, attn_tp_rank=rank),
+        )
+        out = clover_moe._preview_coreset(
+            local, num_tokens=logits.shape[0], block_size=block, top_k=2, top_p=0.5
+        )
+        torch.testing.assert_close(out, expected.tensor_split(tp_size)[rank])
+        rank_local.append(block_coreset(local, local.shape[0], 2, 0.5))
+    # Selecting over each rank's slice alone would route differently.
+    assert not torch.equal(torch.cat(rank_local), expected)
+
+
 class TestSharedExpertLoader(CustomTestCase):
     def test_shared_slot_and_missing_shard(self):
         """The shared expert takes the slot after the packed routed experts."""
@@ -112,6 +141,35 @@ class TestSharedExpertLoader(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "missing shards"):
             CloverMoeModelLM.load_weights(model, weights + shared[:1] + shared[2:])
 
+
+class TestEplbExpertWeights(CustomTestCase):
+    def test_lists_every_local_moe_layer(self):
+        """EPLB rebalances only the layers this map lists; Clover once exposed none."""
+        from sglang.srt.models.clover_moe import (
+            CloverMoeModelLM,
+            CloverSparseMoeBlock,
+            _moe_weights_by_layer,
+        )
+
+        weights = {layer_id: [torch.full((1,), layer_id)] for layer_id in (1, 3, 4)}
+
+        def moe_block(layer_id):
+            block = CloverSparseMoeBlock.__new__(CloverSparseMoeBlock)
+            block.get_moe_weights = lambda: weights[layer_id]
+            return block
+
+        dense = SimpleNamespace(mlp=None)
+        model = SimpleNamespace(
+            layers=[dense, SimpleNamespace(mlp=moe_block(1)), dense]
+            + [SimpleNamespace(mlp=moe_block(i)) for i in (3, 4)],
+            start_layer=0,
+            end_layer=4,
+        )
+
+        self.assertEqual(_moe_weights_by_layer(model), {1: weights[1], 3: weights[3]})
+        self.assertIsInstance(
+            CloverMoeModelLM.__dict__["routed_experts_weights_of_layer"], property
+        )
 
 if __name__ == "__main__":
     import sys

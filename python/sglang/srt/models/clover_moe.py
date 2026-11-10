@@ -21,6 +21,7 @@ from sglang.kernels.ops.moe.clover_coreset_triton import (
     supports_clover_block_coreset_triton,
 )
 from sglang.srt.configs.clover_moe import CloverMoeConfig
+from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layer_boundary import append_stages, declare_attn, declare_ffn
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_QUANT_READOUT,
@@ -59,6 +60,7 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
 from sglang.srt.utils import (
+    LazyValue,
     add_prefix,
     get_bool_env_var,
     is_cuda,
@@ -118,14 +120,33 @@ class CloverRouterGate(ReplicatedLinear):
         self.top_p = top_p
         # Set by CloverSparseMoeBlock.forward for the duration of one preview call.
         self.preview_block_size = None
+        self.preview_num_tokens = None
 
     def forward(self, x):
         logits, bias = super().forward(x)
-        if self.preview_block_size is not None:
-            logits = block_coreset(
-                logits, self.preview_block_size, self.top_k, self.top_p
-            )
+        if self.preview_block_size is None:
+            return logits, bias
+        logits = _preview_coreset(
+            logits,
+            num_tokens=self.preview_num_tokens,
+            block_size=self.preview_block_size,
+            top_k=self.top_k,
+            top_p=self.top_p,
+        )
         return logits, bias
+
+
+def _preview_coreset(logits, *, num_tokens, block_size, top_k, top_p):
+    if logits.shape[0] == num_tokens:
+        return block_coreset(logits, block_size, top_k, top_p)
+    # An a2a backend hands each attention-TP rank an equal contiguous slice
+    # of the rows, so a block can span ranks; select over whole blocks.
+    parallel = get_parallel()
+    assert logits.shape[0] * parallel.attn_tp_size == num_tokens
+    gathered = logits.new_empty((num_tokens, logits.shape[1]))
+    attn_tp_all_gather_into_tensor(gathered, logits.contiguous())
+    gathered = block_coreset(gathered, block_size, top_k, top_p)
+    return gathered.tensor_split(parallel.attn_tp_size)[parallel.attn_tp_rank]
 
 
 class CloverSparseMoeBlock(Qwen2MoeSparseMoeBlock):
@@ -171,13 +192,15 @@ class CloverSparseMoeBlock(Qwen2MoeSparseMoeBlock):
             and forward_batch.forward_mode.is_dllm_extend()
         ):
             return super().forward(hidden_states, forward_batch, defer_finalize)
-        self.gate.preview_block_size = (
-            hidden_states.shape[0] // forward_batch.batch_size
-        )
+        # input_ids stays whole when an a2a backend scatters the hidden rows.
+        num_tokens = forward_batch.input_ids.shape[0]
+        self.gate.preview_num_tokens = num_tokens
+        self.gate.preview_block_size = num_tokens // forward_batch.batch_size
         try:
             return super().forward(hidden_states, forward_batch, defer_finalize)
         finally:
             self.gate.preview_block_size = None
+            self.gate.preview_num_tokens = None
 
 
 class CloverRadixLinearAttention(RadixLinearAttention):
@@ -565,6 +588,14 @@ class CloverMoeModel(Qwen3_5MoeForCausalLM):
     }
 
 
+def _moe_weights_by_layer(model):
+    return {
+        layer_id: model.layers[layer_id].mlp.get_moe_weights()
+        for layer_id in range(model.start_layer, model.end_layer)
+        if isinstance(model.layers[layer_id].mlp, CloverSparseMoeBlock)
+    }
+
+
 class CloverMoeModelLM(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -597,6 +628,9 @@ class CloverMoeModelLM(nn.Module):
         self.logits_processor = LogitsProcessor(text_config, return_full_logits=True)
         self.num_fused_shared_experts = self.model.num_fused_shared_experts
         self.enable_shared_expert_fusion = self.model.enable_shared_expert_fusion
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: _moe_weights_by_layer(self.model)
+        )
 
     @torch.no_grad()
     def forward(
@@ -746,6 +780,10 @@ class CloverMoeModelLM(nn.Module):
     # Clover requires PP=1, so both modules are always local.
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
